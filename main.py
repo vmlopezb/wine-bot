@@ -72,15 +72,11 @@ JSON: {"winery": "", "region": "", "varietal": "", "vintage": ""}"""
             }],
         )
         
-        # Claude responde, intentamos parsear
         response_text = message.content[0].text.strip()
         
-        # A veces Claude agrega texto antes/después del JSON
         try:
-            # Intenta parsear directo
             wine_info = json.loads(response_text)
         except:
-            # Si falla, busca el JSON dentro de la respuesta
             try:
                 start = response_text.find('{')
                 end = response_text.rfind('}') + 1
@@ -182,6 +178,26 @@ async def handle_inventory_query(query, db):
         response += f"• {wine['winery']} {wine['varietal']} ({wine['vintage']}) - {wine['qty']} bot.\n"
     return response
 
+async def handle_remove_wine(query, db):
+    """- bodega = Quita una botella"""
+    search_term = query[1:].strip().lower()
+    if not search_term:
+        return "Uso: -bodega (ej: -Beringer)"
+    
+    matches = [(k, v) for k, v in db["inventory"].items() if search_term in k.lower()]
+    
+    if not matches:
+        return f"❌ No encuentro '{search_term}' en inventario"
+    
+    wine_key, wine = matches[0]
+    
+    if wine["qty"] > 1:
+        wine["qty"] -= 1
+        return f"✅ -1 botella. Quedan: {wine['qty']}"
+    else:
+        del db["inventory"][wine_key]
+        return f"✅ Botella eliminada del inventario"
+
 async def handle_recommendation(query, db):
     context = query.split(":", 1)[1].strip() if ":" in query else ""
     
@@ -208,12 +224,29 @@ Recomienda los 2 mejores. Breve. Coloquial."""
     return message.content[0].text
 
 async def handle_rating(rating_text, db):
+    """rating: bodega: 5 - Rating a botella existente"""
     try:
-        rating = int(rating_text.split(":")[1].strip())
+        parts = rating_text.split(":")
+        
+        if len(parts) == 2:
+            # rating: 5 (al pending_wine)
+            rating = int(parts[1].strip())
+            wine_name = db.get("pending_wine", {}).get("info", {}).get("winery", "wine")
+        elif len(parts) >= 3:
+            # rating: bodega: 5
+            wine_search = parts[1].strip().lower()
+            rating = int(parts[2].strip())
+            
+            matches = [(k, v) for k, v in db["inventory"].items() if wine_search in k.lower()]
+            if not matches:
+                return f"❌ No encuentro '{wine_search}' en inventario"
+            
+            wine_name = matches[0][1]["winery"]
+        else:
+            return "Uso: rating: 5 o rating: bodega: 5"
+        
         if not 1 <= rating <= 5:
             return "Rating 1-5"
-        
-        wine_name = db.get("pending_wine", {}).get("info", {}).get("winery", "wine")
         
         db["history"].append({
             "wine": wine_name,
@@ -221,9 +254,65 @@ async def handle_rating(rating_text, db):
             "date": datetime.now().isoformat()
         })
         
-        return f"⭐ {rating}/5 - Anotado! Mejora tus recomendaciones"
+        return f"⭐ {rating}/5 - {wine_name} anotado! Mejora tus recomendaciones"
     except:
-        return "Uso: rating: 5 (1-5)"
+        return "Uso: rating: 5 o rating: bodega: 5"
+
+async def handle_history(db):
+    """historial - Ver todos los vinos probados"""
+    if not db["history"]:
+        return "📋 Sin historial aún. Prueba vinos y califica con rating: 5"
+    
+    response = "📋 Tu historial de vinos:\n\n"
+    for item in db["history"]:
+        rating_stars = "⭐" * item.get("rating", 0)
+        response += f"{item['wine']} - {rating_stars}\n"
+    
+    response += f"\n📊 Total probados: {len(db['history'])}"
+    return response
+
+async def handle_similar_wines(query, db):
+    """similar: bodega - Vinos parecidos en inventario"""
+    search_term = query.split(":", 1)[1].strip().lower() if ":" in query else ""
+    
+    if not search_term:
+        return "Uso: similar: bodega (ej: similar: Beringer)"
+    
+    if not db["inventory"]:
+        return "📦 Sin vinos en inventario"
+    
+    matching = [(k, v) for k, v in db["inventory"].items() if search_term in k.lower()]
+    
+    if not matching:
+        return f"❌ No encuentro '{search_term}'"
+    
+    wine_key, base_wine = matching[0]
+    
+    similar = []
+    for k, wine in db["inventory"].items():
+        if k == wine_key:
+            continue
+        
+        # Similitud por: mismo varietal, misma región, año cercano
+        same_varietal = wine["varietal"].lower() == base_wine["varietal"].lower()
+        same_region = wine["region"].lower() == base_wine["region"].lower()
+        close_year = abs(int(wine["vintage"]) - int(base_wine["vintage"])) <= 3
+        
+        score = (same_varietal * 3) + (same_region * 2) + (close_year * 1)
+        
+        if score > 0:
+            similar.append((score, wine))
+    
+    if not similar:
+        return f"🍷 No hay parecidos a {base_wine['winery']} en tu inventario"
+    
+    similar.sort(key=lambda x: x[0], reverse=True)
+    
+    response = f"🍷 Parecidos a {base_wine['winery']} {base_wine['vintage']}:\n"
+    for score, wine in similar[:3]:
+        response += f"• {wine['winery']} {wine['varietal']} ({wine['vintage']})\n"
+    
+    return response
 
 # Webhook
 @app.post("/webhook")
@@ -251,11 +340,20 @@ async def webhook(request: Request):
         elif incoming_msg.lower().startswith("?"):
             response_text = await handle_inventory_query(incoming_msg, db)
         
+        elif incoming_msg.lower().startswith("-"):
+            response_text = await handle_remove_wine(incoming_msg, db)
+        
         elif incoming_msg.lower().startswith("rec:"):
             response_text = await handle_recommendation(incoming_msg, db)
         
         elif incoming_msg.lower().startswith("rating:"):
             response_text = await handle_rating(incoming_msg, db)
+        
+        elif incoming_msg.lower().startswith("similar:"):
+            response_text = await handle_similar_wines(incoming_msg, db)
+        
+        elif incoming_msg.lower() == "historial":
+            response_text = await handle_history(db)
         
         elif incoming_msg.lower() == "inv":
             if not db["inventory"]:
@@ -269,19 +367,28 @@ async def webhook(request: Request):
             response_text = """🍷 WINE BOT - MENÚ
 
 📸 ENVÍA FOTO
-Lee etiqueta + Predice si te gusta
+Lee etiqueta + Predice
 
 🔍 ?bodega
-¿Tengo en casa? (ej: ?Rioja)
+¿Tengo en casa?
+
+➖ -bodega
+Quita una botella (bebida)
 
 🍽️ rec: comida
-Recomendación (ej: rec: cordero)
+Recomendación
 
 ⭐ rating: 5
-Califica después de probar (1-5)
+O rating: bodega: 5
+
+🍷 similar: bodega
+Parecidos en inventario
+
+📋 historial
+Vinos probados
 
 📦 inv
-Ver todo tu inventario"""
+Inventario completo"""
         
         else:
             response_text = """¿Qué quieres?

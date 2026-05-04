@@ -72,10 +72,25 @@ JSON: {"winery": "", "region": "", "varietal": "", "vintage": ""}"""
             }],
         )
         
+        # Claude responde, intentamos parsear
+        response_text = message.content[0].text.strip()
+        
+        # A veces Claude agrega texto antes/después del JSON
         try:
-            wine_info = json.loads(message.content[0].text)
+            # Intenta parsear directo
+            wine_info = json.loads(response_text)
         except:
-            return "❌ No leo la etiqueta. ¿Foto más clara?"
+            # Si falla, busca el JSON dentro de la respuesta
+            try:
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                if start != -1 and end > start:
+                    json_str = response_text[start:end]
+                    wine_info = json.loads(json_str)
+                else:
+                    return "❌ No leo la etiqueta. ¿Foto más clara?"
+            except:
+                return "❌ No leo la etiqueta. ¿Foto más clara?"
         
         wine_key = f"{wine_info['winery']}_{wine_info['vintage']}"
         

@@ -21,20 +21,6 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 # Claude
 claude_client = Anthropic()
 
-# Pinecone 3.x
-pinecone_enabled = False
-index = None
-
-try:
-    from pinecone import Pinecone
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    index = pc.Index("wine-embeddings")
-    pinecone_enabled = True
-    print("Pinecone initialized successfully")
-except Exception as e:
-    print(f"Pinecone init failed: {e}")
-    pinecone_enabled = False
-
 # DB Helpers
 def get_db_filename(sender):
     clean_number = sender.replace("whatsapp:", "").replace("+", "")
@@ -45,44 +31,21 @@ def load_db(sender):
     if os.path.exists(db_file):
         with open(db_file, "r") as f:
             return json.load(f)
-    return {"inventory": {}, "history": [], "user_preferences": {}}
+    return {"inventory": {}, "history": [], "pending_wine": None}
 
 def save_db(db, sender):
     db_file = get_db_filename(sender)
     with open(db_file, "w") as f:
         json.dump(db, f, indent=2)
 
-# Pinecone helpers
-def upsert_wine_to_pinecone(wine_id, wine_info):
-    if not pinecone_enabled or index is None:
-        return
-    
-    try:
-        wine_desc = f"{wine_info['winery']} {wine_info['region']} {wine_info['varietal']} {wine_info['vintage']}"
-        embedding = [hash(wine_desc + str(i)) % 256 / 256.0 for i in range(1536)]
-        
-        index.upsert(vectors=[(wine_id, embedding, wine_info)])
-        print(f"Upserted {wine_id} to Pinecone")
-    except Exception as e:
-        print(f"Pinecone upsert error: {e}")
-
-def find_similar_wines(wine_id, top_k=3):
-    if not pinecone_enabled or index is None:
-        return []
-    
-    try:
-        results = index.query(id=wine_id, top_k=top_k, include_metadata=True)
-        return results.get("matches", []) if results else []
-    except Exception as e:
-        print(f"Pinecone query error: {e}")
-        return []
-
 # Handlers
 async def handle_wine_photo(media_url, db, sender):
+    """Usuario envía foto. Extraer + Predecir + Preguntar si agregar."""
     try:
         img_response = requests.get(media_url)
         img_base64 = base64.b64encode(img_response.content).decode("utf-8")
         
+        # Claude Vision extrae info
         message = claude_client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=500,
@@ -99,15 +62,13 @@ async def handle_wine_photo(media_url, db, sender):
                     },
                     {
                         "type": "text",
-                        "text": """Extrae info de etiqueta de vino:
+                        "text": """Extrae SOLO esto de la etiqueta:
 - Bodega/Winery
 - Región
-- Varietal
+- Varietal (uva)
 - Vintage (año)
-- Notas
 
-Responde SOLO en JSON:
-{"winery": "", "region": "", "varietal": "", "vintage": "", "notes": ""}"""
+JSON: {"winery": "", "region": "", "varietal": "", "vintage": ""}"""
                     }
                 ],
             }],
@@ -116,36 +77,84 @@ Responde SOLO en JSON:
         try:
             wine_info = json.loads(message.content[0].text)
         except:
-            return "❌ No pude leer la etiqueta. ¿Intentamos de nuevo?"
+            return "❌ No leo la etiqueta. ¿Foto más clara?"
         
         wine_key = f"{wine_info['winery']}_{wine_info['vintage']}"
         
-        if wine_key in db["inventory"]:
-            current_qty = db["inventory"][wine_key].get("qty", 1)
-            db["inventory"][wine_key]["qty"] = current_qty + 1
-            return f"✅ Ya tenías {wine_info['winery']} ({wine_info['vintage']})!\nAhora tienes {current_qty + 1} botellas."
+        # Guarda wine temporalmente para la decisión
+        db["pending_wine"] = {
+            "key": wine_key,
+            "info": wine_info
+        }
+        
+        # Ahora predice basado en historial
+        if db["history"]:
+            liked_wines = [w for w in db["history"] if w.get("rating", 0) >= 4]
+            if liked_wines:
+                history_str = json.dumps(liked_wines, indent=2)
+                pred_message = claude_client.messages.create(
+                    model="claude-3-5-sonnet-20241022",
+                    max_tokens=150,
+                    messages=[{
+                        "role": "user",
+                        "content": f"""¿Me va a gustar?
+
+Vinos que amé:
+{history_str}
+
+Candidato: {wine_info['winery']} {wine_info['varietal']} {wine_info['vintage']}
+
+Responde BREVE: probabilidad % y por qué."""
+                    }],
+                )
+                prediction = pred_message.content[0].text
+            else:
+                prediction = "Sin historial aún para predecir"
         else:
-            db["inventory"][wine_key] = {
-                "winery": wine_info["winery"],
-                "region": wine_info["region"],
-                "varietal": wine_info["varietal"],
-                "vintage": wine_info["vintage"],
-                "notes": wine_info.get("notes", ""),
-                "qty": 1,
-                "date_added": datetime.now().isoformat()
-            }
-            
-            clean_number = sender.replace("whatsapp:", "").replace("+", "")
-            wine_id = f"{clean_number}_{wine_key}".lower().replace(" ", "_")
-            upsert_wine_to_pinecone(wine_id, db["inventory"][wine_key])
-            
-            return f"""📝 Agregué a tu inventario:
+            prediction = "Sin historial aún para predecir"
+        
+        response = f"""📸 Extraído:
 {wine_info['winery']} {wine_info['varietal']} {wine_info['vintage']}
-Región: {wine_info['region']}"""
+Región: {wine_info['region']}
+
+🎯 {prediction}
+
+¿Lo agregamos a inventario?
+Responde: "sí" o "no"
+"""
+        return response
+    
     except Exception as e:
-        return f"❌ Error procesando foto: {str(e)}"
+        return f"❌ Error: {str(e)}"
+
+async def handle_yes_add(db):
+    """User dijo 'sí' - agregar a inventario"""
+    if not db.get("pending_wine"):
+        return "❌ No hay vino pendiente. Envía una foto primero"
+    
+    wine_key = db["pending_wine"]["key"]
+    wine_info = db["pending_wine"]["info"]
+    
+    if wine_key in db["inventory"]:
+        current_qty = db["inventory"][wine_key].get("qty", 1)
+        db["inventory"][wine_key]["qty"] = current_qty + 1
+        response = f"✅ +1 botella. Total: {current_qty + 1}"
+    else:
+        db["inventory"][wine_key] = {
+            "winery": wine_info["winery"],
+            "region": wine_info["region"],
+            "varietal": wine_info["varietal"],
+            "vintage": wine_info["vintage"],
+            "qty": 1,
+            "date_added": datetime.now().isoformat()
+        }
+        response = f"✅ Agregado a inventario"
+    
+    db["pending_wine"] = None
+    return response
 
 async def handle_inventory_query(query, db):
+    """?bodega - ¿Tengo este vino?"""
     search_term = query[1:].strip().lower()
     if not search_term:
         return "Uso: ?bodega (ej: ?Rioja)"
@@ -156,102 +165,57 @@ async def handle_inventory_query(query, db):
             matches.append(wine)
     
     if not matches:
-        return f"❌ No encuentro '{search_term}'"
+        return f"❌ No tienes '{search_term}'"
     
-    response = "🍷 **Lo que tienes:**\n"
+    response = "🍷 Lo que tienes:\n"
     for wine in matches[:5]:
         response += f"• {wine['winery']} {wine['varietal']} ({wine['vintage']}) - {wine['qty']} bot.\n"
     return response
 
 async def handle_recommendation(query, db):
+    """rec: pescado - Recomendación para comida"""
     context = query.split(":", 1)[1].strip() if ":" in query else ""
+    
     if not context:
         return "Uso: rec: comida (ej: rec: cordero)"
     if not db["inventory"]:
-        return "📦 No tienes vinos aún. ¡Envía fotos!"
+        return "📦 Sin vinos en inventario. ¡Envía fotos!"
     
     inventory_str = json.dumps(db["inventory"], indent=2)
-    message = claude_client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=400,
-        messages=[{
-            "role": "user",
-            "content": f"""Sommelier experto. Inventario:
-
-{inventory_str}
-
-Usuario quiere vino para: {context}
-
-Recomienda 2-3 mejores. Explica por qué. Coloquial."""
-        }],
-    )
-    return message.content[0].text
-
-async def handle_prediction(wine_name, db):
-    if not db["history"]:
-        return "⭐ Aún sin calificaciones. Manda: rating: 5"
-    
-    liked_wines = [w for w in db["history"] if w.get("rating", 0) >= 4]
-    if not liked_wines:
-        return "⭐ Sin historial de vinos que te gusten."
-    
-    history_str = json.dumps(liked_wines, indent=2)
     message = claude_client.messages.create(
         model="claude-3-5-sonnet-20241022",
         max_tokens=300,
         messages=[{
             "role": "user",
-            "content": f"""¿Le va a gustar este vino?
+            "content": f"""Sommelier. Inventario:
 
-Vinos que amó:
-{history_str}
+{inventory_str}
 
-Candidato: {wine_name}
+Quiero vino para: {context}
 
-Analiza similitud y probabilidad."""
+Recomienda los 2 mejores. Breve. Coloquial."""
         }],
     )
     return message.content[0].text
 
-async def handle_similar_wines(wine_name, db):
-    if not db["inventory"]:
-        return "📦 No tienes vinos aún."
-    
-    matching = [(k, v) for k, v in db["inventory"].items() if wine_name.lower() in f"{v['winery']} {v['vintage']}".lower()]
-    if not matching:
-        return f"❌ No encuentro '{wine_name}'"
-    
-    wine_key, wine = matching[0]
-    
-    if not pinecone_enabled:
-        return "⚠️ Pinecone no conectado"
-    
-    similar = find_similar_wines(wine_key, top_k=3)
-    if not similar:
-        return f"🍷 Sin similares para {wine['winery']}"
-    
-    response = f"🍷 **Parecidos a {wine['winery']} {wine['vintage']}:**\n"
-    for match in similar:
-        if "metadata" in match:
-            m = match["metadata"]
-            response += f"• {m.get('winery', '?')} {m.get('varietal', '')} ({m.get('vintage', '')})\n"
-    return response
-
 async def handle_rating(rating_text, db):
+    """rating: 5 - Califica último vino"""
     try:
         rating = int(rating_text.split(":")[1].strip())
         if not 1 <= rating <= 5:
-            return "Rating debe ser 1-5"
+            return "Rating 1-5"
+        
+        wine_name = db.get("pending_wine", {}).get("info", {}).get("winery", "wine")
         
         db["history"].append({
-            "wine": "wine",
+            "wine": wine_name,
             "rating": rating,
             "date": datetime.now().isoformat()
         })
         
-        return f"⭐ {rating}/5 - Anotado!"
+        return f"⭐ {rating}/5 - Anotado! Mejora tus recomendaciones"
     except:
-        return "Uso: rating: 1 (o 2, 3, 4, 5)"
+        return "Uso: rating: 5 (1-5)"
 
 # Webhook
 @app.post("/webhook")
@@ -266,45 +230,57 @@ async def webhook(request: Request):
     
     try:
         if num_media > 0:
+            # 📸 FOTO - Lo más importante
             media_url = form_data.get("MediaUrl0", "")
             response_text = await handle_wine_photo(media_url, db, sender)
+        
+        elif incoming_msg.lower() in ["sí", "si", "yes"]:
+            # Agregar a inventario
+            response_text = await handle_yes_add(db)
+        
+        elif incoming_msg.lower() in ["no"]:
+            # No agregar
+            db["pending_wine"] = None
+            response_text = "❌ No agregado"
+        
         elif incoming_msg.lower().startswith("?"):
+            # ¿Tengo?
             response_text = await handle_inventory_query(incoming_msg, db)
+        
         elif incoming_msg.lower().startswith("rec:"):
+            # Recomendación
             response_text = await handle_recommendation(incoming_msg, db)
-        elif incoming_msg.lower().startswith("pred:"):
-            wine_name = incoming_msg.split(":", 1)[1].strip()
-            response_text = await handle_prediction(wine_name, db)
-        elif incoming_msg.lower().startswith("similar:"):
-            wine_name = incoming_msg.split(":", 1)[1].strip()
-            response_text = await handle_similar_wines(wine_name, db)
+        
         elif incoming_msg.lower().startswith("rating:"):
+            # Califica
             response_text = await handle_rating(incoming_msg, db)
-        elif incoming_msg.lower() in ["help", "ayuda", "hola"]:
-            response_text = """🍷 **WINE BOT:**
-
-📸 Foto etiqueta → Extraigo + guardo
-
-?Bodega → ¿Tengo en casa?
-
-rec: comida → Recomendación
-
-pred: vino → ¿Me va a gustar?
-
-similar: vino → Parecidos
-
-rating: 1-5 → Valora
-
-inv → Inventario"""
+        
         elif incoming_msg.lower() == "inv":
+            # Inventario completo
             if not db["inventory"]:
-                response_text = "📦 No tienes vinos aún."
+                response_text = "📦 Sin vinos"
             else:
-                response_text = "🍷 **Tu inventario:**\n"
+                response_text = "🍷 Tu inventario:\n"
                 for wine_key, wine in db["inventory"].items():
                     response_text += f"• {wine['winery']} {wine['varietal']} ({wine['vintage']}) - {wine['qty']} bot.\n"
+        
+        elif incoming_msg.lower() in ["help", "ayuda", "hola"]:
+            response_text = """🍷 WINE BOT:
+
+📸 FOTO = Extraer + Predecir + ¿Agregar?
+   Responde: "sí" o "no"
+
+?Bodega = ¿Tengo?
+
+rec: comida = Recomendación
+
+inv = Inventario
+
+rating: 5 = Califica (1-5)"""
+        
         else:
             response_text = "No entendí. Manda 'ayuda'"
+    
     except Exception as e:
         response_text = f"❌ Error: {str(e)}"
         print(f"Error: {e}")

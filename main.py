@@ -41,7 +41,7 @@ def save_db(db, sender):
 # Handlers
 async def handle_wine_photo(media_url, db, sender):
     try:
-        img_response = requests.get(media_url)
+        img_response = requests.get(media_url, auth=(TWILIO_SID, TWILIO_TOKEN))
         img_base64 = base64.b64encode(img_response.content).decode("utf-8")
         
         message = claude_client.messages.create(

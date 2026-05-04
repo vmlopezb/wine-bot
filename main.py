@@ -40,14 +40,12 @@ def save_db(db, sender):
 
 # Handlers
 async def handle_wine_photo(media_url, db, sender):
-    """Usuario envía foto. Extraer + Predecir + Preguntar si agregar."""
     try:
         img_response = requests.get(media_url)
         img_base64 = base64.b64encode(img_response.content).decode("utf-8")
         
-        # Claude Vision extrae info
         message = claude_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-opus-4-6",
             max_tokens=500,
             messages=[{
                 "role": "user",
@@ -81,19 +79,17 @@ JSON: {"winery": "", "region": "", "varietal": "", "vintage": ""}"""
         
         wine_key = f"{wine_info['winery']}_{wine_info['vintage']}"
         
-        # Guarda wine temporalmente para la decisión
         db["pending_wine"] = {
             "key": wine_key,
             "info": wine_info
         }
         
-        # Ahora predice basado en historial
         if db["history"]:
             liked_wines = [w for w in db["history"] if w.get("rating", 0) >= 4]
             if liked_wines:
                 history_str = json.dumps(liked_wines, indent=2)
                 pred_message = claude_client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
+                    model="claude-opus-4-6",
                     max_tokens=150,
                     messages=[{
                         "role": "user",
@@ -120,7 +116,8 @@ Región: {wine_info['region']}
 🎯 {prediction}
 
 ¿Lo agregamos a inventario?
-Responde: "sí" o "no"
+1️⃣ sí
+2️⃣ no
 """
         return response
     
@@ -128,7 +125,6 @@ Responde: "sí" o "no"
         return f"❌ Error: {str(e)}"
 
 async def handle_yes_add(db):
-    """User dijo 'sí' - agregar a inventario"""
     if not db.get("pending_wine"):
         return "❌ No hay vino pendiente. Envía una foto primero"
     
@@ -154,7 +150,6 @@ async def handle_yes_add(db):
     return response
 
 async def handle_inventory_query(query, db):
-    """?bodega - ¿Tengo este vino?"""
     search_term = query[1:].strip().lower()
     if not search_term:
         return "Uso: ?bodega (ej: ?Rioja)"
@@ -173,7 +168,6 @@ async def handle_inventory_query(query, db):
     return response
 
 async def handle_recommendation(query, db):
-    """rec: pescado - Recomendación para comida"""
     context = query.split(":", 1)[1].strip() if ":" in query else ""
     
     if not context:
@@ -183,7 +177,7 @@ async def handle_recommendation(query, db):
     
     inventory_str = json.dumps(db["inventory"], indent=2)
     message = claude_client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-opus-4-6",
         max_tokens=300,
         messages=[{
             "role": "user",
@@ -199,7 +193,6 @@ Recomienda los 2 mejores. Breve. Coloquial."""
     return message.content[0].text
 
 async def handle_rating(rating_text, db):
-    """rating: 5 - Califica último vino"""
     try:
         rating = int(rating_text.split(":")[1].strip())
         if not 1 <= rating <= 5:
@@ -230,33 +223,26 @@ async def webhook(request: Request):
     
     try:
         if num_media > 0:
-            # 📸 FOTO - Lo más importante
             media_url = form_data.get("MediaUrl0", "")
             response_text = await handle_wine_photo(media_url, db, sender)
         
-        elif incoming_msg.lower() in ["sí", "si", "yes"]:
-            # Agregar a inventario
+        elif incoming_msg.lower() in ["sí", "si", "yes", "1"]:
             response_text = await handle_yes_add(db)
         
-        elif incoming_msg.lower() in ["no"]:
-            # No agregar
+        elif incoming_msg.lower() in ["no", "2"]:
             db["pending_wine"] = None
             response_text = "❌ No agregado"
         
         elif incoming_msg.lower().startswith("?"):
-            # ¿Tengo?
             response_text = await handle_inventory_query(incoming_msg, db)
         
         elif incoming_msg.lower().startswith("rec:"):
-            # Recomendación
             response_text = await handle_recommendation(incoming_msg, db)
         
         elif incoming_msg.lower().startswith("rating:"):
-            # Califica
             response_text = await handle_rating(incoming_msg, db)
         
         elif incoming_msg.lower() == "inv":
-            # Inventario completo
             if not db["inventory"]:
                 response_text = "📦 Sin vinos"
             else:
@@ -264,22 +250,30 @@ async def webhook(request: Request):
                 for wine_key, wine in db["inventory"].items():
                     response_text += f"• {wine['winery']} {wine['varietal']} ({wine['vintage']}) - {wine['qty']} bot.\n"
         
-        elif incoming_msg.lower() in ["help", "ayuda", "hola"]:
-            response_text = """🍷 WINE BOT:
+        elif incoming_msg.lower() in ["menu", "menú"]:
+            response_text = """🍷 WINE BOT - MENÚ
 
-📸 FOTO = Extraer + Predecir + ¿Agregar?
-   Responde: "sí" o "no"
+📸 ENVÍA FOTO
+Lee etiqueta + Predice si te gusta
 
-?Bodega = ¿Tengo?
+🔍 ?bodega
+¿Tengo en casa? (ej: ?Rioja)
 
-rec: comida = Recomendación
+🍽️ rec: comida
+Recomendación (ej: rec: cordero)
 
-inv = Inventario
+⭐ rating: 5
+Califica después de probar (1-5)
 
-rating: 5 = Califica (1-5)"""
+📦 inv
+Ver todo tu inventario"""
         
         else:
-            response_text = "No entendí. Manda 'ayuda'"
+            response_text = """¿Qué quieres?
+
+📸 Envía foto de vino
+
+Manda 'menú' para ver todas las opciones"""
     
     except Exception as e:
         response_text = f"❌ Error: {str(e)}"

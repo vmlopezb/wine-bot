@@ -19,7 +19,7 @@ TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # Claude
-claude_client = Anthropic()
+claude_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 
 # DB Helpers
 def get_db_filename(sender):

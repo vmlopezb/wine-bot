@@ -21,14 +21,14 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 # Claude
 claude_client = Anthropic()
 
-# Pinecone - Sintaxis 2.2.4 correcta
+# Pinecone 3.x
 pinecone_enabled = False
 index = None
 
 try:
-    from pinecone import init, Index
-    init(api_key=os.getenv("PINECONE_API_KEY"), environment="us-west4-gcp")
-    index = Index("wine-embeddings")
+    from pinecone import Pinecone
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    index = pc.Index("wine-embeddings")
     pinecone_enabled = True
     print("Pinecone initialized successfully")
 except Exception as e:

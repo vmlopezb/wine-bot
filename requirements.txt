@@ -4,6 +4,5 @@ python-dotenv==1.0.0
 twilio==9.2.0
 anthropic==0.28.0
 requests==2.31.0
-pinecone
 httpx==0.26.0
 python-multipart==0.0.6
